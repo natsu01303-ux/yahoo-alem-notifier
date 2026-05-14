@@ -170,6 +170,23 @@ def main() -> int:
                 return 1
     else:
         print("First run: seeding state without sending notifications.")
+        latest = new_comments[-1] if new_comments else None
+        latest_info = (
+            f"📋 直近の投稿: {latest['thread']} No.{latest['no']} ({latest['date']})"
+            if latest
+            else "📋 直近の投稿: なし"
+        )
+        try:
+            send_telegram(
+                "✅ <b>アレム通知Bot 稼働開始</b>\n"
+                f"監視中のコメント数: {len(comments)}件\n"
+                f"{latest_info}\n\n"
+                "次回以降、新着投稿があったらこのチャットに通知します🔔"
+            )
+            print("Sent initialization message.")
+        except Exception as e:
+            print(f"Init message send failed: {e}")
+            return 1
 
     all_ids = list(seen) + [c["id"] for c in new_comments]
     state["seen_ids"] = all_ids[-300:]
