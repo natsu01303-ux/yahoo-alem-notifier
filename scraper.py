@@ -17,9 +17,8 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TARGET_URL = f"https://finance.yahoo.co.jp/cm/personal/history/comment?user={USER_ID}"
 STATE_FILE = Path(__file__).parent / "state.json"
 
-DATE_RE = re.compile(r"\d{4}/\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2}")
 COMMENT_NO_RE = re.compile(r"No\.(\d+)")
-MESSAGE_PATH_RE = re.compile(r"/cm/message/(\d+)/([0-9a-f]+)(?:/(\d+))?")
+BASE_URL = "https://finance.yahoo.co.jp"
 
 
 def fetch_page() -> str:
@@ -35,67 +34,56 @@ def fetch_page() -> str:
     return r.text
 
 
+def _abs_url(href: str) -> str:
+    if href.startswith("/"):
+        return BASE_URL + href
+    return href
+
+
 def parse_comments(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "lxml")
     results: list[dict] = []
     seen_keys: set[str] = set()
 
-    for li in soup.find_all("li"):
-        text = li.get_text(" ", strip=True)
-        if not text:
-            continue
-        date_match = DATE_RE.search(text)
-        no_match = COMMENT_NO_RE.search(text)
-        if not (date_match and no_match):
+    for box in soup.select("li.commentBox"):
+        thread_a = box.select_one(".breadcrumbs a")
+        cn_el = box.select_one(".commentNumber")
+        date_p = box.select_one(".ttlInfoDateNum p")
+        if not (thread_a and cn_el and date_p):
             continue
 
-        thread_link = None
-        comment_link = None
-        for a in li.find_all("a", href=True):
-            href = a["href"]
-            m = MESSAGE_PATH_RE.search(href)
-            if not m:
-                continue
-            if m.group(3):
-                comment_link = (a.get_text(strip=True), href)
-            else:
-                thread_link = (a.get_text(strip=True), href)
-
-        if not thread_link:
+        no_match = COMMENT_NO_RE.search(cn_el.get_text())
+        if not no_match:
             continue
 
-        thread_name, thread_href = thread_link
+        thread_name = thread_a.get_text(strip=True)
+        thread_href = thread_a.get("href", "")
         comment_no = no_match.group(1)
-        date_str = date_match.group(0)
+        date_str = date_p.get_text(strip=True)
 
         key = f"{thread_href}#{comment_no}"
         if key in seen_keys:
             continue
         seen_keys.add(key)
 
-        body = text
-        body = DATE_RE.sub("", body)
-        body = COMMENT_NO_RE.sub("", body)
-        if thread_name:
-            body = body.replace(thread_name, "", 1)
-        body = body.strip(" 　-:|・")
+        detail = box.select_one(".detail")
+        body = detail.get_text(" ", strip=True) if detail else ""
+        if not body:
+            title_a = box.select_one(".commentTitleArea a")
+            if title_a:
+                body = title_a.get_text(strip=True)
 
-        if comment_link:
-            permalink = comment_link[1]
+        title_a = box.select_one(".commentTitleArea a")
+        if title_a and title_a.get("href"):
+            permalink = _abs_url(title_a["href"])
         else:
-            permalink = thread_href.rstrip("/") + f"/{comment_no}"
-        if permalink.startswith("/"):
-            permalink = "https://finance.yahoo.co.jp" + permalink
+            permalink = _abs_url(thread_href.rstrip("/") + f"/{comment_no}")
 
         results.append(
             {
                 "id": key,
                 "thread": thread_name,
-                "thread_url": (
-                    "https://finance.yahoo.co.jp" + thread_href
-                    if thread_href.startswith("/")
-                    else thread_href
-                ),
+                "thread_url": _abs_url(thread_href),
                 "no": comment_no,
                 "date": date_str,
                 "body": body,
