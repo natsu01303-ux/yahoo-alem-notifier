@@ -1,4 +1,4 @@
-"""Yahoo!ファイナンス掲示板のアレムさんの投稿を監視してTelegramに通知する。"""
+"""Yahoo!ファイナンス掲示板の特定ユーザーの投稿を監視してTelegramに通知する。"""
 from __future__ import annotations
 
 import json
@@ -10,18 +10,21 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 
-USER_ID = os.environ.get("YAHOO_USER_ID", "")
+USERS = [
+    {"id": "a0e75bad9ac76a357687d1a3ca723486b99744308f803019ba98546a376608cc", "name": "アレム"},
+    {"id": "c0e57a2eee7fbb312c9bd5d4caffbf34591d50b0c8ab68086397c1d2f3b78840", "name": "カルダノ"},
+]
+
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-TARGET_URL = f"https://finance.yahoo.co.jp/cm/personal/history/comment?user={USER_ID}"
 STATE_FILE = Path(__file__).parent / "state.json"
-
-COMMENT_NO_RE = re.compile(r"No\.(\d+)")
 BASE_URL = "https://finance.yahoo.co.jp"
+COMMENT_NO_RE = re.compile(r"No\.(\d+)")
 
 
-def fetch_page() -> str:
+def fetch_page(user_id: str) -> str:
+    url = f"{BASE_URL}/cm/personal/history/comment?user={user_id}"
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -29,7 +32,7 @@ def fetch_page() -> str:
         ),
         "Accept-Language": "ja,en;q=0.8",
     }
-    r = requests.get(TARGET_URL, headers=headers, timeout=30)
+    r = requests.get(url, headers=headers, timeout=30)
     r.raise_for_status()
     return r.text
 
@@ -68,12 +71,10 @@ def parse_comments(html: str) -> list[dict]:
 
         detail = box.select_one(".detail")
         body = detail.get_text(" ", strip=True) if detail else ""
-        if not body:
-            title_a = box.select_one(".commentTitleArea a")
-            if title_a:
-                body = title_a.get_text(strip=True)
-
         title_a = box.select_one(".commentTitleArea a")
+        if not body and title_a:
+            body = title_a.get_text(strip=True)
+
         if title_a and title_a.get("href"):
             permalink = _abs_url(title_a["href"])
         else:
@@ -95,9 +96,20 @@ def parse_comments(html: str) -> list[dict]:
 
 
 def load_state() -> dict:
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    return {"seen_ids": [], "initialized": False}
+    if not STATE_FILE.exists():
+        return {"users": {}}
+    data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    if "users" in data:
+        return data
+    legacy_user_id = USERS[0]["id"]
+    return {
+        "users": {
+            legacy_user_id: {
+                "seen_ids": data.get("seen_ids", []),
+                "initialized": data.get("initialized", False),
+            }
+        }
+    }
 
 
 def save_state(state: dict) -> None:
@@ -126,12 +138,12 @@ def html_escape(s: str) -> str:
     )
 
 
-def format_message(c: dict) -> str:
+def format_message(user_name: str, c: dict) -> str:
     body = html_escape(c["body"])
     if len(body) > 600:
         body = body[:600] + "…"
     return (
-        f"🔔 <b>アレムさんが投稿</b>\n"
+        f"🔔 <b>{html_escape(user_name)}さんが投稿</b>\n"
         f"📋 <b>{html_escape(c['thread'])}</b>  No.{c['no']}\n"
         f"🕒 {html_escape(c['date'])}\n\n"
         f"{body}\n\n"
@@ -139,37 +151,38 @@ def format_message(c: dict) -> str:
     )
 
 
-def main() -> int:
-    if not (USER_ID and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
-        print("ERROR: Missing env vars (YAHOO_USER_ID / TELEGRAM_TOKEN / TELEGRAM_CHAT_ID)")
-        return 2
+def process_user(user: dict, state: dict) -> bool:
+    name, uid = user["name"], user["id"]
+    user_state = state["users"].setdefault(uid, {"seen_ids": [], "initialized": False})
 
-    html = fetch_page()
+    try:
+        html = fetch_page(uid)
+    except Exception as e:
+        print(f"[{name}] fetch failed: {e}")
+        return False
+
     comments = parse_comments(html)
-    print(f"Fetched {len(comments)} comments from page.")
-
+    print(f"[{name}] Fetched {len(comments)} comments.")
     if not comments:
-        print("WARNING: parser returned 0 comments. HTML structure may have changed.")
-        return 0
+        print(f"[{name}] WARNING: parser returned 0 comments.")
+        return True
 
-    state = load_state()
-    seen: set[str] = set(state.get("seen_ids", []))
-    initialized: bool = state.get("initialized", False)
-
+    seen = set(user_state.get("seen_ids", []))
+    initialized = user_state.get("initialized", False)
     new_comments = [c for c in comments if c["id"] not in seen]
     new_comments.sort(key=lambda c: c["date"])
-    print(f"New comments: {len(new_comments)}")
+    print(f"[{name}] New comments: {len(new_comments)}")
 
     if initialized:
         for c in new_comments:
             try:
-                send_telegram(format_message(c))
-                print(f"Notified: {c['thread']} No.{c['no']}")
+                send_telegram(format_message(name, c))
+                print(f"[{name}] Notified: {c['thread']} No.{c['no']}")
             except Exception as e:
-                print(f"Telegram send failed: {e}")
-                return 1
+                print(f"[{name}] Telegram send failed: {e}")
+                return False
     else:
-        print("First run: seeding state without sending notifications.")
+        print(f"[{name}] First run: seeding state without sending all notifications.")
         latest = new_comments[-1] if new_comments else None
         latest_info = (
             f"📋 直近の投稿: {latest['thread']} No.{latest['no']} ({latest['date']})"
@@ -178,21 +191,34 @@ def main() -> int:
         )
         try:
             send_telegram(
-                "✅ <b>アレム通知Bot 稼働開始</b>\n"
+                f"✅ <b>{html_escape(name)}さんの監視を開始しました</b>\n"
                 f"監視中のコメント数: {len(comments)}件\n"
                 f"{latest_info}\n\n"
                 "次回以降、新着投稿があったらこのチャットに通知します🔔"
             )
-            print("Sent initialization message.")
+            print(f"[{name}] Sent initialization message.")
         except Exception as e:
-            print(f"Init message send failed: {e}")
-            return 1
+            print(f"[{name}] Init message send failed: {e}")
+            return False
 
     all_ids = list(seen) + [c["id"] for c in new_comments]
-    state["seen_ids"] = all_ids[-300:]
-    state["initialized"] = True
+    user_state["seen_ids"] = all_ids[-300:]
+    user_state["initialized"] = True
+    return True
+
+
+def main() -> int:
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
+        print("ERROR: Missing env vars (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID)")
+        return 2
+
+    state = load_state()
+    ok = True
+    for user in USERS:
+        if not process_user(user, state):
+            ok = False
     save_state(state)
-    return 0
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
